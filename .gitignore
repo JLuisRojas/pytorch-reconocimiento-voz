@@ -1,3 +1,3 @@
 *.DS_Store
-./dataset/common-voice/es/
-./envRecVoz/
+dataset/common-voice/es/
+envRecVoz/
