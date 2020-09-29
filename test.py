@@ -1,3 +1,4 @@
+import math
 import pandas as pd
 import torch
 import torchaudio
@@ -92,6 +93,8 @@ class CommonVoiceDataset(Dataset):
         spec = self.specgram(waveform)
         spec = spec.log2()
 
+        spec = torch.unsqueeze(spec, 0)
+
         # Quita los valores 
         #spec[spec == float('-inf')] = 0
 
@@ -109,25 +112,71 @@ class CommonVoiceDataset(Dataset):
             'sentence': sentence_encoded
         }
 
+
+class DeepRNN(nn.Module):
+    def __init__(self, input_size, hidden_size):
+        super(DeepRNN, self).__init__()
+        self.rnn = nn.GRU(input_size=input_size, hidden_size=hidden_size,
+                bias=True)
+
+    def forward(self, x):
+        x, h = self.rnn(x)
+
+        return x
+
 class DeepSpeech2(nn.Module):
     def __init__(self,
-                 sample_rate=48000):
+                 sample_rate=48000,
+                 window_size=0.01,
+                 rnn_hidden_size=64):
         super(DeepSpeech2, self).__init__()
 
         self.sample_rate = sample_rate
         self.convs = nn.Sequential(
             # N, 1, 125, L ->
             nn.Conv2d(1, 32, kernel_size=(41, 11), stride=(2, 2), padding=(20,5)),
+            nn.BatchNorm2d(32),
             nn.ReLU(),
             nn.Conv2d(32, 32, kernel_size=(21, 11), stride=(2, 1), padding=(10, 5)),
-            nn.ReLU(),
+            nn.BatchNorm2d(32),
+            nn.ReLU()
         )
 
-        # Formula para calcular shape
+        # Formula para calcular shape despues de las conv y colapsando los
+        # filtros y las features
         # s = (W - K + 2P)/ S+1
+        self.rnn_input_size = int(math.floor((sample_rate * window_size) / 2) + 1)
+        self.rnn_input_size = int(math.floor(self.rnn_input_size + 2 * 20 - 41) / 2 + 1)
+        self.rnn_input_size = int(math.floor(self.rnn_input_size + 2 * 10 - 21) / 2 + 1)
+        self.rnn_input_size *= 32
+
+        self.rnn_hidden_size = rnn_hidden_size
+
+        self.rnn = DeepRNN(input_size=self.rnn_input_size,
+                hidden_size=self.rnn_hidden_size)
+
+        print(self.rnn_input_size)
+
 
     def forward(self, x):
         _x = self.convs(x)
+        # x -> (batch, chanels, features, seq_length)
+
+        print(_x.shape)
+
+        # Colapsa los filtros y las features
+        sizes = _x.size()
+        _x = _x.view(sizes[0], sizes[1]*sizes[2], sizes[3])
+        # x -> (batch, channels*features, seq_length)
+        print(_x.shape)
+
+        # Permuta el tensor para que sea:
+        # (batch, seq_length, features)
+        _x = torch.einsum('bfs->bsf', _x)
+        print(_x.shape)
+
+        _x = self.rnn(_x)
+
         return _x
 
 class PadCollate:
@@ -144,8 +193,8 @@ class PadCollate:
             features_shape = e['features'].shape
             sentence_shape = e['sentence'].shape
 
-            features_lengths.append(features_shape[2])
-            sentence_lenghts.append(sentence_shape[1])
+            features_lengths.append(features_shape[-1])
+            sentence_lenghts.append(sentence_shape[-1])
 
         max_features_length = max(features_lengths)
         max_sentence_length = max(sentence_lenghts)
@@ -173,9 +222,9 @@ class PadCollate:
         sentence_lenghts = torch.Tensor(sentence_lenghts)
 
         print(batch_features.shape)
-        print(batch_sentences.shape)
-        print(features_lengths.shape)
-        print(sentence_lenghts.shape)
+        #print(batch_sentences.shape)
+        #print(features_lengths.shape)
+        #print(sentence_lenghts.shape)
 
         return (batch_features, batch_sentences, features_lengths, sentence_lenghts)
 
@@ -183,11 +232,21 @@ dataset_dev = CommonVoiceDataset(vocab=VocabEsp())
 
 loader = DataLoader(dataset_dev, batch_size=2, collate_fn=PadCollate())
 
-for batch_ndx, sample in enumerate(loader):
-    print(batch_ndx)
-    # print(sample)
+model = DeepSpeech2()
+
+features, sentences, fl, sl = next(iter(loader))
+
+y = model(features)
+
+print(y.shape)
 
 """
+for batch_ndx, sample in enumerate(loader):
+    features, sentences, fl, sl = sample
+    y = model(features)
+    print(y.shape)
+
+
 for i in range(16, 17):
     x_i = dataset_dev[i]
 
