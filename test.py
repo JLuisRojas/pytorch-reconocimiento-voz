@@ -5,6 +5,7 @@ import torchaudio
 import matplotlib.pyplot as plt
 from torch.utils.data import Dataset, DataLoader
 from torch import nn
+from collections import OrderedDict
 import pytorch_lightning as pl
 import torch.nn.functional as F
 
@@ -112,12 +113,34 @@ class CommonVoiceDataset(Dataset):
             'sentence': sentence_encoded
         }
 
+class SequenceWise(nn.Module):
+    def __init__(self, module):
+        """
+        Colapsa el input de (B, T, F) a (B*T, F) y aplica el modulo
+        al input colapsado
+        """
+        super(SequenceWise, self).__init__()
+        self.module = module
+
+    def forward(self, x):
+        b, t = x.size(0), x.size(1)
+        x = x.view(b * t, -1)
+        x = self.module(x)
+        x = x.view(b, t, -1)
+        return x
+
+    def __repr__(self):
+        tmpstr = self.__class__.__name__ + ' (\n'
+        tmpstr += self.module.__repr__()
+        tmpstr += ')'
+        return tmpstr
+
 
 class DeepRNN(nn.Module):
     def __init__(self, input_size, hidden_size):
         super(DeepRNN, self).__init__()
         self.rnn = nn.GRU(input_size=input_size, hidden_size=hidden_size,
-                bias=True)
+                bias=True, bidirectional=True)
 
     def forward(self, x):
         x, h = self.rnn(x)
@@ -128,8 +151,11 @@ class DeepSpeech2(nn.Module):
     def __init__(self,
                  sample_rate=48000,
                  window_size=0.01,
-                 rnn_hidden_size=64):
+                 rnn_hidden_size=400, 
+                 vocab_len=27):
         super(DeepSpeech2, self).__init__()
+
+        self.vocab_len = vocab_len
 
         self.sample_rate = sample_rate
         self.convs = nn.Sequential(
@@ -152,10 +178,31 @@ class DeepSpeech2(nn.Module):
 
         self.rnn_hidden_size = rnn_hidden_size
 
-        self.rnn = DeepRNN(input_size=self.rnn_input_size,
-                hidden_size=self.rnn_hidden_size)
+        rnns_layers = []
+
+        rnns_layers.append((f"rnn_0", DeepRNN(input_size=self.rnn_input_size,
+                hidden_size=self.rnn_hidden_size)))
+
+        for r in range(1, 5):
+            rnns_layers.append((f"rnn_{r}",
+                DeepRNN(input_size=self.rnn_hidden_size*2,
+                hidden_size=self.rnn_hidden_size)))
+
+        self.rnns = nn.Sequential(OrderedDict(rnns_layers))
+
+        # Sequence wise fc, que colapsa las 2 primer dimensiones
+        self.fc1 = SequenceWise(nn.Sequential(
+            nn.Linear(rnn_hidden_size*2, 1024, bias=False),
+            nn.ReLU()
+        ))
+
+        self.fc2 = SequenceWise(
+            nn.Linear(1024, self.vocab_len, bias=False)
+        )
 
         print(self.rnn_input_size)
+
+        self.sm = nn.Softmax(dim=-1)
 
 
     def forward(self, x):
@@ -175,7 +222,16 @@ class DeepSpeech2(nn.Module):
         _x = torch.einsum('bfs->bsf', _x)
         print(_x.shape)
 
-        _x = self.rnn(_x)
+        _x = self.rnns(_x)
+        # (batch, seq_length, rnn_hidden_size)
+        print(_x.shape)
+
+        # Aplica la fc a todos los t
+        _x = self.fc1(_x)
+        _x = self.fc2(_x)
+
+        # Aplica softmax
+        _x = self.sm(_x)
 
         return _x
 
