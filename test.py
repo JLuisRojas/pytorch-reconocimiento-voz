@@ -284,6 +284,64 @@ class PadCollate:
 
         return (batch_features, batch_sentences, features_lengths, sentence_lenghts)
 
+class CVDataModule(pl.LightningDataModule):
+    def __init__(batch_size=32):
+        super().__init__()
+        self.batch_size = batch_size)
+
+    # TODO: implemetar con las distribuciones correctas
+    def setup(self, stage):
+        if stage == 'fit':
+            self.cv_train = CommonVoiceDataset(vocab=VocabEsp())
+            self.cv_val = CommonVoiceDataset(vocab=VocabEsp())
+
+        if stage == 'test':
+            self.cv_test = CommonVoiceDataset(vocab=VocabEsp())
+
+    def train_dataloader(self):
+        return DataLoader(self.cv_train, batch_size=self.batch_size, collate_fn=PadCollate())
+
+    def val_dataloader(self):
+        return DataLoader(self.cv_val, batch_size=self.batch_size, collate_fn=PadCollate())
+
+    def test_dataloader(self):
+        return DataLoader(self.cv_test, batch_size=self.batch_size, collate_fn=PadCollate())
+
+class DSModule(pl.LightningModule):
+    def __init__(self, params):
+        pass
+
+    def forward(self):
+        pass
+
+    def training_step(self):
+        pass
+
+    def training_step_end(self):
+        pass
+
+    def training_epoch_end(self):
+        pass
+
+    def validation_step(self):
+        pass
+
+    def validation_step_end(self):
+        pass
+
+    def validation_epoch_end(self):
+        pass
+
+    def test_step(self):
+        pass
+
+    def test_step_end(...)
+
+    def test_epoch_end(...)
+
+    def configure_optimizers(...)
+
+"""
 dataset_dev = CommonVoiceDataset(vocab=VocabEsp())
 
 loader = DataLoader(dataset_dev, batch_size=2, collate_fn=PadCollate())
@@ -296,7 +354,6 @@ y = model(features)
 
 print(y.shape)
 
-"""
 for batch_ndx, sample in enumerate(loader):
     features, sentences, fl, sl = sample
     y = model(features)
