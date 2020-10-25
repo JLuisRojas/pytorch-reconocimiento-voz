@@ -64,7 +64,7 @@ class CommonVoiceDataset(Dataset):
         self.vocab = vocab
         self.vocab_len = len(vocab)
 
-        print(f"Vocab len: {self.vocab_len}")
+        #print(f"Vocab len: {self.vocab_len}")
 
         self.specgram = torchaudio.transforms.Spectrogram(
             normalized=True,
@@ -97,11 +97,22 @@ class CommonVoiceDataset(Dataset):
         spec = torch.unsqueeze(spec, 0)
 
         # Quita los valores 
-        #spec[spec == float('-inf')] = 0
+        mask = spec == float('-inf')
+
+        spec[mask] = 0
+
+        mean = torch.mean(spec)
+        std = torch.std(spec)
+
+        gain = 1.0 / (torch.max(torch.abs(spec)) + 1e-5)
+
+        spec *= gain
+
+        spec[mask] = -1.0
 
         # Se corta la parte de alta frequencia
         # solo se deja 125 bins
-        #spec = spec[:, :125, :] # c, h, w
+        spec = spec[:, :125, :] # c, h, w
 
         # Codifica la oracion
         sentence_encoded = torch.Tensor(self.vocab(sentence))
@@ -124,9 +135,9 @@ class SequenceWise(nn.Module):
 
     def forward(self, x):
         b, t = x.size(0), x.size(1)
-        x = x.view(b * t, -1)
+        x = x.view(b * t, -1).contiguous()
         x = self.module(x)
-        x = x.view(b, t, -1)
+        x = x.view(b, t, -1).contiguous()
         return x
 
     def __repr__(self):
@@ -151,7 +162,7 @@ class DeepSpeech2(nn.Module):
     def __init__(self,
                  sample_rate=48000,
                  window_size=0.01,
-                 rnn_hidden_size=400, 
+                 rnn_hidden_size=400,
                  vocab_len=27):
         super(DeepSpeech2, self).__init__()
 
@@ -200,7 +211,7 @@ class DeepSpeech2(nn.Module):
             nn.Linear(1024, self.vocab_len, bias=False)
         )
 
-        print(self.rnn_input_size)
+        #print(self.rnn_input_size)
 
         self.sm = nn.Softmax(dim=-1)
 
@@ -209,22 +220,22 @@ class DeepSpeech2(nn.Module):
         _x = self.convs(x)
         # x -> (batch, chanels, features, seq_length)
 
-        print(_x.shape)
+        #print(_x.shape)
 
         # Colapsa los filtros y las features
         sizes = _x.size()
-        _x = _x.view(sizes[0], sizes[1]*sizes[2], sizes[3])
+        _x = _x.view(sizes[0], sizes[1]*sizes[2], sizes[3]).contiguous()
         # x -> (batch, channels*features, seq_length)
-        print(_x.shape)
+        #print(_x.shape)
 
         # Permuta el tensor para que sea:
         # (batch, seq_length, features)
         _x = torch.einsum('bfs->bsf', _x)
-        print(_x.shape)
+        #print(_x.shape)
 
         _x = self.rnns(_x)
         # (batch, seq_length, rnn_hidden_size)
-        print(_x.shape)
+        #print(_x.shape)
 
         # Aplica la fc a todos los t
         _x = self.fc1(_x)
@@ -274,10 +285,10 @@ class PadCollate:
         batch_features = torch.cat(batch_features, 0)
         batch_sentences = torch.cat(batch_sentences, 0)
 
-        features_lengths = torch.Tensor(features_lengths)
-        sentence_lenghts = torch.Tensor(sentence_lenghts)
+        features_lengths = torch.Tensor(features_lengths).type(torch.int32)
+        sentence_lenghts = torch.Tensor(sentence_lenghts).type(torch.int32)
 
-        print(batch_features.shape)
+        #print(batch_features.shape)
         #print(batch_sentences.shape)
         #print(features_lengths.shape)
         #print(sentence_lenghts.shape)
@@ -285,9 +296,9 @@ class PadCollate:
         return (batch_features, batch_sentences, features_lengths, sentence_lenghts)
 
 class CVDataModule(pl.LightningDataModule):
-    def __init__(batch_size=32):
+    def __init__(self, batch_size=32):
         super().__init__()
-        self.batch_size = batch_size)
+        self.batch_size = batch_size
 
     # TODO: implemetar con las distribuciones correctas
     def setup(self, stage):
@@ -299,47 +310,79 @@ class CVDataModule(pl.LightningDataModule):
             self.cv_test = CommonVoiceDataset(vocab=VocabEsp())
 
     def train_dataloader(self):
-        return DataLoader(self.cv_train, batch_size=self.batch_size, collate_fn=PadCollate())
+        return DataLoader(self.cv_train, num_workers=8, batch_size=self.batch_size, collate_fn=PadCollate())
 
     def val_dataloader(self):
-        return DataLoader(self.cv_val, batch_size=self.batch_size, collate_fn=PadCollate())
+        return DataLoader(self.cv_val, num_workers=8, batch_size=self.batch_size, collate_fn=PadCollate())
 
     def test_dataloader(self):
-        return DataLoader(self.cv_test, batch_size=self.batch_size, collate_fn=PadCollate())
+        return DataLoader(self.cv_test, num_workers=8, batch_size=self.batch_size, collate_fn=PadCollate())
 
 class DSModule(pl.LightningModule):
     def __init__(self, params):
-        pass
+        super().__init__()
+        self.model = DeepSpeech2()
+        self.ctc_loss = nn.CTCLoss(reduction='none')
 
-    def forward(self):
-        pass
+    def forward(self, x):
+        y = self.model(x)
 
-    def training_step(self):
-        pass
+        return y
 
-    def training_step_end(self):
-        pass
+    def configure_optimizers(self):
+        optimizer = torch.optim.Adam(self.parameters(), lr=1e-3)
 
-    def training_epoch_end(self):
-        pass
+        return optimizer
 
-    def validation_step(self):
-        pass
+    def _ctc_reshape(self, y):
+        sizes = y.size()
 
-    def validation_step_end(self):
-        pass
+        fl = torch.full((sizes[0],), sizes[1], dtype=torch.int32)
 
-    def validation_epoch_end(self):
-        pass
+        y = y.view(sizes[1], sizes[0], sizes[2]).contiguous()
 
-    def test_step(self):
-        pass
+        return y, fl
 
-    def test_step_end(...)
+    def training_step(self, batch, batch_idx):
+        features, sentences, fl, sl = batch
 
-    def test_epoch_end(...)
+        _y = self(features)
 
-    def configure_optimizers(...)
+        _y, fl = self._ctc_reshape(_y)
+
+        loss = self.ctc_loss(_y, sentences, fl, sl).mean()
+
+        #self.log('training_loss', loss)
+
+        return -loss
+
+    def validation_step(self, batch, batch_idx):
+        features, sentences, fl, sl = batch
+
+        _y = self(features)
+
+        _y, fl = self._ctc_reshape(_y)
+
+        loss = self.ctc_loss(_y, sentences, fl, sl)
+
+        return -loss
+
+    def validation_epoch_end(self, outputs):
+        loss = torch.cat([o for o in outputs], 0).mean()
+
+        return {
+            'loss': loss
+        }
+
+data_module = CVDataModule(batch_size=2)
+
+model = DSModule({})
+
+trainer = pl.Trainer(
+    fast_dev_run=True
+)
+
+trainer.fit(model, data_module)
 
 """
 dataset_dev = CommonVoiceDataset(vocab=VocabEsp())
@@ -352,12 +395,12 @@ features, sentences, fl, sl = next(iter(loader))
 
 y = model(features)
 
-print(y.shape)
+#print(y.shape)
 
-for batch_ndx, sample in enumerate(loader):
-    features, sentences, fl, sl = sample
-    y = model(features)
-    print(y.shape)
+#for batch_ndx, sample in enumerate(loader):
+#    features, sentences, fl, sl = sample
+#    y = model(features)
+#    print(y.shape)
 
 
 for i in range(16, 17):
@@ -371,8 +414,9 @@ for i in range(16, 17):
     print(y.shape)
 
     print(x)
+    print(torch.max(torch.abs(x)))
 
     plt.figure()
-    plt.imshow(x[0, :, :].numpy(), origin='lower')
+    plt.imshow(x[0, 0, :, :].numpy(), origin='lower')
     plt.show(block=True)
 """
