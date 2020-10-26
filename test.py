@@ -3,17 +3,66 @@ import pandas as pd
 import torch
 import torchaudio
 import matplotlib.pyplot as plt
+from ctcdecode import CTCBeamDecoder
 from torch.utils.data import Dataset, DataLoader
 from torch import nn
 from collections import OrderedDict
 import pytorch_lightning as pl
 import torch.nn.functional as F
 
+import numpy as np
+
+def wer(r, h):
+    """
+	https://martin-thoma.com/word-error-rate-calculation/
+    Calculation of WER with Levenshtein distance.
+    Works only for iterables up to 254 elements (uint8).
+    O(nm) time ans space complexity.
+    Parameters
+    ----------
+    r : list
+    h : list
+    Returns
+    -------
+    int
+    Examples
+    --------
+    >>> wer("who is there".split(), "is there".split())
+    1
+    >>> wer("who is there".split(), "".split())
+    3
+    >>> wer("".split(), "who is there".split())
+    3
+    """
+    # initialisation
+
+    d = np.zeros((len(r) + 1) * (len(h) + 1), dtype=np.uint8)
+    d = d.reshape((len(r) + 1, len(h) + 1))
+    for i in range(len(r) + 1):
+        for j in range(len(h) + 1):
+            if i == 0:
+                d[0][j] = j
+            elif j == 0:
+                d[i][0] = i
+
+    # computation
+    for i in range(1, len(r) + 1):
+        for j in range(1, len(h) + 1):
+            if r[i - 1] == h[j - 1]:
+                d[i][j] = d[i - 1][j - 1]
+            else:
+                substitution = d[i - 1][j - 1] + 1
+                insertion = d[i][j - 1] + 1
+                deletion = d[i - 1][j] + 1
+                d[i][j] = min(substitution, insertion, deletion)
+
+    return d[len(r)][len(h)]
+
 class VocabEsp:
     def __init__(self):
         self.chars = [
             'a', 'b', 'c',
-            'd', 'f', 'g',
+            'd', 'e', 'f', 'g',
             'h', 'i', 'j',
             'k', 'l', 'm',
             'n', 'ñ', 'o',
@@ -41,7 +90,7 @@ class VocabEsp:
         return res
 
     def __len__(self):
-        return len(self.chars)
+        return len(self.chars) + 1
 
 class CommonVoiceDataset(Dataset):
     """ Common Voice Dataset """
@@ -64,7 +113,7 @@ class CommonVoiceDataset(Dataset):
         self.vocab = vocab
         self.vocab_len = len(vocab)
 
-        #print(f"Vocab len: {self.vocab_len}")
+        print(f"Vocab len: {self.vocab_len}")
 
         self.specgram = torchaudio.transforms.Spectrogram(
             normalized=True,
@@ -163,7 +212,7 @@ class DeepSpeech2(nn.Module):
                  sample_rate=48000,
                  window_size=0.01,
                  rnn_hidden_size=400,
-                 vocab_len=27):
+                 vocab_len=29):
         super(DeepSpeech2, self).__init__()
 
         self.vocab_len = vocab_len
@@ -323,6 +372,12 @@ class DSModule(pl.LightningModule):
         super().__init__()
         self.model = DeepSpeech2()
         self.ctc_loss = nn.CTCLoss(reduction='none')
+        self.vocab_str = list('_abcdefghijklmnñopqrstuvwxyz ')
+        print(len(self.vocab_str))
+
+        self.ctc_decoder =  CTCBeamDecoder(
+            self.vocab_str
+        )
 
     def forward(self, x):
         y = self.model(x)
@@ -339,20 +394,71 @@ class DSModule(pl.LightningModule):
 
         fl = torch.full((sizes[0],), sizes[1], dtype=torch.int32)
 
+        # T, N, C
         y = y.view(sizes[1], sizes[0], sizes[2]).contiguous()
 
         return y, fl
 
+    def _ctc_decode(self, y):
+        beam_results, _, _, out_len = self.ctc_decoder.decode(y)
+
+        batch_size, beams, _ = beam_results.size()
+
+        results = []
+        for batch_idx in range(batch_size):
+            results.append(beam_results[batch_idx][0][:out_len[batch_idx][0]])
+
+        return results
+
+    def _decode(self, sentence):
+        sentence = sentence.type(torch.int32)
+
+        string = ''
+
+        for c in sentence:
+            string += self.vocab_str[c.item()]
+
+        return string
+
+
+    def _wer(self, sentences, sentence_lenghts, decoded):
+        batch_size, _ = sentences.size()
+
+        sentences_true = []
+        sentences_predicted = []
+
+        sum_wer = 0
+
+        for batch_idx in range(batch_size):
+            sentence_true = sentences[batch_idx][:sentence_lenghts[batch_idx]]
+
+            sentence_true = self._decode(sentence_true)
+            sentence_predicted = self._decode(decoded[batch_idx])
+
+            size_true_words = len(sentence_true.split())
+
+            _wer = wer(sentence_true.split(), sentence_predicted.split())
+
+            _wer = size_true_words / _wer
+
+            if _wer > 1: _wer = 1
+
+            sum_wer += _wer
+
+        return sum_wer / batch_size
+
     def training_step(self, batch, batch_idx):
         features, sentences, fl, sl = batch
 
-        _y = self(features)
+        _y_m = self(features)
 
-        _y, fl = self._ctc_reshape(_y)
+        _y, fl = self._ctc_reshape(_y_m)
 
         loss = self.ctc_loss(_y, sentences, fl, sl).mean()
 
-        #self.log('training_loss', loss)
+        decoded = self._ctc_decode(_y_m)
+
+        wer_metric = self._wer(sentences, sl, decoded)
 
         return -loss
 
