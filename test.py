@@ -9,6 +9,7 @@ from torch import nn
 from collections import OrderedDict
 import pytorch_lightning as pl
 import torch.nn.functional as F
+from pytorch_lightning.loggers import TensorBoardLogger
 
 import numpy as np
 
@@ -113,7 +114,7 @@ class CommonVoiceDataset(Dataset):
         self.vocab = vocab
         self.vocab_len = len(vocab)
 
-        print(f"Vocab len: {self.vocab_len}")
+        #print(f"Vocab len: {self.vocab_len}")
 
         self.specgram = torchaudio.transforms.Spectrogram(
             normalized=True,
@@ -460,7 +461,13 @@ class DSModule(pl.LightningModule):
 
         wer_metric = self._wer(sentences, sl, decoded)
 
-        return -loss
+        return {
+            'loss': -loss,
+            'log': {
+                'training_loss': -loss,
+                'training_wer': wer_metric
+            }
+        }
 
     def validation_step(self, batch, batch_idx):
         features, sentences, fl, sl = batch
@@ -471,21 +478,29 @@ class DSModule(pl.LightningModule):
 
         loss = self.ctc_loss(_y, sentences, fl, sl)
 
-        return -loss
+        return {
+            'loss': -loss
+        }
 
     def validation_epoch_end(self, outputs):
-        loss = torch.cat([o for o in outputs], 0).mean()
+        loss = torch.cat([o['loss'] for o in outputs], 0).mean()
+
+        out = { 'loss': loss }
 
         return {
-            'loss': loss
+            **out,
+            'log': out
         }
 
 data_module = CVDataModule(batch_size=2)
 
 model = DSModule({})
 
+logger = TensorBoardLogger('logs', name='DeepSpeech2')
+
 trainer = pl.Trainer(
-    fast_dev_run=True
+    fast_dev_run=True,
+    logger=logger
 )
 
 trainer.fit(model, data_module)
