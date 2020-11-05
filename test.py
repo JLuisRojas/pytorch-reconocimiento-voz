@@ -1,4 +1,9 @@
+import warnings
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+warnings.filterwarnings("ignore", category=UserWarning)
+
 import math
+import numpy as np
 import pandas as pd
 import torch
 import torchaudio
@@ -12,6 +17,16 @@ import torch.nn.functional as F
 from pytorch_lightning.loggers import TensorBoardLogger
 
 import numpy as np
+import random
+
+seed = 43
+torch.manual_seed(seed)
+np.random.seed(seed)
+random.seed(seed)
+
+torch.cuda.manual_seed_all(seed)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
 
 def wer(r, h):
     """
@@ -103,7 +118,7 @@ class CommonVoiceDataset(Dataset):
                  sample_rate=48000,
                  vocab=None):
         self.root_dir = root_dir
-        self.data_dir = f"{root_dir}common-voice/{audio_distrib}/"
+        self.data_dir = f"{root_dir}cv-corpus-5.1-2020-06-22/{audio_distrib}/"
         self.clips_dir = f"{self.data_dir}clips/"
 
         self.audio_distrib = audio_distrib
@@ -124,6 +139,10 @@ class CommonVoiceDataset(Dataset):
         )
 
         self.df = pd.read_csv(f"{self.data_dir}{distrib}.tsv", sep='\t')
+        if distrib == 'train':
+            self.df = self.df.head(1)
+        else:
+            self.df = self.df.head(1)
 
     def __len__(self):
         return len(self.df.index)
@@ -141,6 +160,8 @@ class CommonVoiceDataset(Dataset):
 
         waveform, sample_rate = torchaudio.load(audio_path)
 
+        waveform = waveform / 32767
+
         spec = self.specgram(waveform)
         spec = spec.log2()
 
@@ -154,15 +175,20 @@ class CommonVoiceDataset(Dataset):
         mean = torch.mean(spec)
         std = torch.std(spec)
 
+        spec = (spec - mean) / std
+
         gain = 1.0 / (torch.max(torch.abs(spec)) + 1e-5)
 
         spec *= gain
 
         spec[mask] = -1.0
 
+        #spec = (spec + 1.0) / 2
+
         # Se corta la parte de alta frequencia
         # solo se deja 125 bins
-        spec = spec[:, :125, :] # c, h, w
+        print(spec.shape)
+        #spec = spec[:, :, :125, :] # c, h, w
 
         # Codifica la oracion
         sentence_encoded = torch.Tensor(self.vocab(sentence))
@@ -185,9 +211,9 @@ class SequenceWise(nn.Module):
 
     def forward(self, x):
         b, t = x.size(0), x.size(1)
-        x = x.view(b * t, -1).contiguous()
+        x = x.contiguous().view(b * t, -1)
         x = self.module(x)
-        x = x.view(b, t, -1).contiguous()
+        x = x.contiguous().view(b, t, -1)
         return x
 
     def __repr__(self):
@@ -195,6 +221,35 @@ class SequenceWise(nn.Module):
         tmpstr += self.module.__repr__()
         tmpstr += ')'
         return tmpstr
+
+class MaskConv(nn.Module):
+    def __init__(self, seq_module):
+        """
+        Adds padding to the output of the module based on the given lengths. This is to ensure that the
+        results of the model do not change when batch sizes change during inference.
+        Input needs to be in the shape of (BxCxDxT)
+        :param seq_module: The sequential module containing the conv stack.
+        """
+        super(MaskConv, self).__init__()
+        self.seq_module = seq_module
+
+    def forward(self, x, lengths):
+        """
+        :param x: The input of size BxCxDxT
+        :param lengths: The actual length of each sequence in the batch
+        :return: Masked output from the module
+        """
+        for module in self.seq_module:
+            x = module(x)
+            mask = torch.BoolTensor(x.size()).fill_(0)
+            if x.is_cuda:
+                mask = mask.cuda()
+            for i, length in enumerate(lengths):
+                length = length.item()
+                if (mask[i].size(2) - length) > 0:
+                    mask[i].narrow(2, length, mask[i].size(2) - length).fill_(1)
+            x = x.masked_fill(mask, 0)
+        return x, lengths
 
 
 class DeepRNN(nn.Module):
@@ -219,15 +274,15 @@ class DeepSpeech2(nn.Module):
         self.vocab_len = vocab_len
 
         self.sample_rate = sample_rate
-        self.convs = nn.Sequential(
+        self.convs = MaskConv(nn.Sequential(
             # N, 1, 125, L ->
             nn.Conv2d(1, 32, kernel_size=(41, 11), stride=(2, 2), padding=(20,5)),
             nn.BatchNorm2d(32),
-            nn.ReLU(),
+            nn.Hardtanh(0, 20, inplace=True), #nn.ReLU(),
             nn.Conv2d(32, 32, kernel_size=(21, 11), stride=(2, 1), padding=(10, 5)),
             nn.BatchNorm2d(32),
-            nn.ReLU()
-        )
+            nn.Hardtanh(0, 20, inplace=True), #nn.ReLU()
+        ))
 
         # Formula para calcular shape despues de las conv y colapsando los
         # filtros y las features
@@ -253,34 +308,38 @@ class DeepSpeech2(nn.Module):
 
         # Sequence wise fc, que colapsa las 2 primer dimensiones
         self.fc1 = SequenceWise(nn.Sequential(
-            nn.Linear(rnn_hidden_size*2, 1024, bias=False),
-            nn.ReLU()
+            nn.BatchNorm1d(rnn_hidden_size*2),
+            nn.Linear(rnn_hidden_size*2, self.vocab_len, bias=False)
+            #nn.ReLU()
         ))
 
-        self.fc2 = SequenceWise(
-            nn.Linear(1024, self.vocab_len, bias=False)
-        )
+        #self.fc2 = SequenceWise(
+        #    nn.Linear(1024, self.vocab_len, bias=False)
+        #)
 
         #print(self.rnn_input_size)
 
         self.sm = nn.Softmax(dim=-1)
 
 
-    def forward(self, x):
-        _x = self.convs(x)
+    def forward(self, x, seq_len):
+        seq_len = self.get_seq_lens(seq_len)
+
+        _x, _ = self.convs(x, seq_len)
         # x -> (batch, chanels, features, seq_length)
 
         #print(_x.shape)
 
         # Colapsa los filtros y las features
         sizes = _x.size()
-        _x = _x.view(sizes[0], sizes[1]*sizes[2], sizes[3]).contiguous()
+        _x = _x.contiguous().view(sizes[0], sizes[1]*sizes[2], sizes[3])
         # x -> (batch, channels*features, seq_length)
         #print(_x.shape)
 
         # Permuta el tensor para que sea:
         # (batch, seq_length, features)
-        _x = torch.einsum('bfs->bsf', _x)
+        #_x = torch.einsum('bfs->bsf', _x)
+        _x = _x.transpose(1, 2)
         #print(_x.shape)
 
         _x = self.rnns(_x)
@@ -289,12 +348,29 @@ class DeepSpeech2(nn.Module):
 
         # Aplica la fc a todos los t
         _x = self.fc1(_x)
-        _x = self.fc2(_x)
+        #_x = self.fc2(_x)
+
+        #print(_x.shape)
 
         # Aplica softmax
-        _x = self.sm(_x)
+        #_x = self.sm(_x)
+        _x = torch.nn.functional.log_softmax(_x, dim=-1)
 
-        return _x
+        return _x, seq_len
+
+    def get_seq_lens(self, input_length):
+        """
+        Given a 1D Tensor or Variable containing integer sequence lengths, return a 1D tensor or variable
+        containing the size sequences that will be output by the network.
+        :param input_length: 1D Tensor
+        :return: 1D Tensor scaled by model
+        """
+        seq_len = input_length
+        for m in self.convs.modules():
+            if type(m) == nn.modules.conv.Conv2d:
+                seq_len = ((seq_len + 2 * m.padding[1] - m.dilation[1] * (m.kernel_size[1] - 1) - 1) / m.stride[1] + 1)
+
+        return seq_len.int()
 
 class PadCollate:
     def __init__(self):
@@ -353,20 +429,20 @@ class CVDataModule(pl.LightningDataModule):
     # TODO: implemetar con las distribuciones correctas
     def setup(self, stage):
         if stage == 'fit':
-            self.cv_train = CommonVoiceDataset(vocab=VocabEsp())
-            self.cv_val = CommonVoiceDataset(vocab=VocabEsp())
+            self.cv_train = CommonVoiceDataset(vocab=VocabEsp(), distrib='train')
+            self.cv_val = CommonVoiceDataset(vocab=VocabEsp(), distrib='test')
 
         if stage == 'test':
-            self.cv_test = CommonVoiceDataset(vocab=VocabEsp())
+            self.cv_test = CommonVoiceDataset(vocab=VocabEsp(), distrib='test')
 
     def train_dataloader(self):
-        return DataLoader(self.cv_train, num_workers=8, batch_size=self.batch_size, collate_fn=PadCollate())
+        return DataLoader(self.cv_train, num_workers=12, batch_size=self.batch_size, collate_fn=PadCollate())
 
     def val_dataloader(self):
-        return DataLoader(self.cv_val, num_workers=8, batch_size=self.batch_size, collate_fn=PadCollate())
+        return DataLoader(self.cv_val, num_workers=12, batch_size=self.batch_size, collate_fn=PadCollate())
 
     def test_dataloader(self):
-        return DataLoader(self.cv_test, num_workers=8, batch_size=self.batch_size, collate_fn=PadCollate())
+        return DataLoader(self.cv_test, num_workers=12, batch_size=self.batch_size, collate_fn=PadCollate())
 
 class DSModule(pl.LightningModule):
     def __init__(self, params):
@@ -374,31 +450,33 @@ class DSModule(pl.LightningModule):
         self.model = DeepSpeech2()
         self.ctc_loss = nn.CTCLoss(reduction='none')
         self.vocab_str = list('_abcdefghijklmnñopqrstuvwxyz ')
-        print(len(self.vocab_str))
+        print(self.vocab_str)
 
         self.ctc_decoder =  CTCBeamDecoder(
-            self.vocab_str
+            self.vocab_str,
+            log_probs_input=True
         )
 
-    def forward(self, x):
-        y = self.model(x)
+    def forward(self, x, seq_len):
+        y, seq_len = self.model(x, seq_len)
 
-        return y
+        return y, seq_len
 
     def configure_optimizers(self):
-        optimizer = torch.optim.Adam(self.parameters(), lr=1e-3)
+        optimizer = torch.optim.Adam(self.parameters(), lr=3e-4)
 
         return optimizer
 
     def _ctc_reshape(self, y):
         sizes = y.size()
 
-        fl = torch.full((sizes[0],), sizes[1], dtype=torch.int32)
+        #fl = torch.full((sizes[0],), sizes[1], dtype=torch.int32)
 
         # T, N, C
-        y = y.view(sizes[1], sizes[0], sizes[2]).contiguous()
+        #y = y.contiguous().view(sizes[1], sizes[0], sizes[2])
+        y = y.permute(1, 0, 2)
 
-        return y, fl
+        return y#, fl
 
     def _ctc_decode(self, y):
         beam_results, _, _, out_len = self.ctc_decoder.decode(y)
@@ -436,6 +514,11 @@ class DSModule(pl.LightningModule):
             sentence_true = self._decode(sentence_true)
             sentence_predicted = self._decode(decoded[batch_idx])
 
+            print("TRUE")
+            print(sentence_true)
+            print("PREDICTED")
+            print(sentence_predicted)
+
             size_true_words = len(sentence_true.split())
 
             _wer = wer(sentence_true.split(), sentence_predicted.split())
@@ -450,10 +533,15 @@ class DSModule(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         features, sentences, fl, sl = batch
+        print(features.shape)
+        print(sentences.shape)
+        print(fl)
+        print(sl)
 
-        _y_m = self(features)
+        _y_m, fl = self(features, fl)
+        print(fl)
 
-        _y, fl = self._ctc_reshape(_y_m)
+        _y = self._ctc_reshape(_y_m)
 
         loss = self.ctc_loss(_y, sentences, fl, sl).mean()
 
@@ -462,45 +550,65 @@ class DSModule(pl.LightningModule):
         wer_metric = self._wer(sentences, sl, decoded)
 
         return {
-            'loss': -loss,
-            'log': {
-                'training_loss': -loss,
-                'training_wer': wer_metric
-            }
+            'loss': loss,
+            'wer_metric': wer_metric
         }
+
+    
+    def training_epoch_end(self, outputs):
+        loss = np.mean([o['loss'].item() for o in outputs])
+        wer_metric = np.mean([o['wer_metric'] for o in outputs])
+
+        self.logger.experiment.add_scalar(
+            'Loss/Train',
+            loss,
+            self.current_epoch
+        )
+
+        self.logger.experiment.add_scalar(
+            'WER/Train',
+            wer_metric,
+            self.current_epoch
+        )
 
     def validation_step(self, batch, batch_idx):
         features, sentences, fl, sl = batch
 
-        _y = self(features)
+        _y, fl = self(features, fl)
 
-        _y, fl = self._ctc_reshape(_y)
+        _y = self._ctc_reshape(_y)
 
         loss = self.ctc_loss(_y, sentences, fl, sl)
 
         return {
-            'loss': -loss
+            'loss': loss
         }
 
     def validation_epoch_end(self, outputs):
         loss = torch.cat([o['loss'] for o in outputs], 0).mean()
 
-        out = { 'loss': loss }
+        self.logger.experiment.add_scalar(
+            'Loss/Val',
+            loss,
+            self.current_epoch
+        )
 
-        return {
-            **out,
-            'log': out
+        return { 
+            'loss': loss 
         }
 
-data_module = CVDataModule(batch_size=2)
+print('ADIOS3')
+
+data_module = CVDataModule(batch_size=1)
 
 model = DSModule({})
 
 logger = TensorBoardLogger('logs', name='DeepSpeech2')
 
 trainer = pl.Trainer(
-    fast_dev_run=True,
-    logger=logger
+    #fast_dev_run=True,
+    logger=logger,
+    gpus=(1 if torch.cuda.is_available() else 0)
 )
 
 trainer.fit(model, data_module)
