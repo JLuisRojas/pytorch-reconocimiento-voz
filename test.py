@@ -140,9 +140,9 @@ class CommonVoiceDataset(Dataset):
 
         self.df = pd.read_csv(f"{self.data_dir}{distrib}.tsv", sep='\t')
         if distrib == 'train':
-            self.df = self.df.head(1)
-        else:
-            self.df = self.df.head(1)
+            self.df = self.df.head(30000)
+        #else:
+        #    self.df = self.df.head(5000)
 
     def __len__(self):
         return len(self.df.index)
@@ -187,7 +187,7 @@ class CommonVoiceDataset(Dataset):
 
         # Se corta la parte de alta frequencia
         # solo se deja 125 bins
-        print(spec.shape)
+        #print(spec.shape)
         #spec = spec[:, :, :125, :] # c, h, w
 
         # Codifica la oracion
@@ -514,16 +514,16 @@ class DSModule(pl.LightningModule):
             sentence_true = self._decode(sentence_true)
             sentence_predicted = self._decode(decoded[batch_idx])
 
-            print("TRUE")
-            print(sentence_true)
-            print("PREDICTED")
-            print(sentence_predicted)
+            #print("TRUE")
+            #print(sentence_true)
+            #print("PREDICTED")
+            #print(sentence_predicted)
 
             size_true_words = len(sentence_true.split())
 
             _wer = wer(sentence_true.split(), sentence_predicted.split())
 
-            _wer = size_true_words / _wer
+            _wer = _wer / size_true_words
 
             if _wer > 1: _wer = 1
 
@@ -533,13 +533,13 @@ class DSModule(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         features, sentences, fl, sl = batch
-        print(features.shape)
-        print(sentences.shape)
-        print(fl)
-        print(sl)
+        #print(features.shape)
+        #print(sentences.shape)
+        #print(fl)
+        #print(sl)
 
         _y_m, fl = self(features, fl)
-        print(fl)
+        #print(fl)
 
         _y = self._ctc_reshape(_y_m)
 
@@ -599,7 +599,7 @@ class DSModule(pl.LightningModule):
 
 print('ADIOS3')
 
-data_module = CVDataModule(batch_size=1)
+data_module = CVDataModule(batch_size=16)
 
 model = DSModule({})
 
