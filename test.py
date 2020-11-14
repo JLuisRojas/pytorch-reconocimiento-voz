@@ -119,6 +119,7 @@ class CommonVoiceDataset(Dataset):
                  vocab=None):
         self.root_dir = root_dir
         self.data_dir = f"{root_dir}cv-corpus-5.1-2020-06-22/{audio_distrib}/"
+        #self.data_dir = f"{root_dir}common-voice/{audio_distrib}/"
         self.clips_dir = f"{self.data_dir}clips/"
 
         self.audio_distrib = audio_distrib
