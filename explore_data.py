@@ -2,7 +2,7 @@ import pandas as pd
 import numpy as np
 
 def main():
-    df = pd.read_csv("./dataset/cv-corpus-5.1-2020-06-22/es/train.tsv", sep='\t')
+    df = pd.read_csv("./dataset/cv-corpus-5.1-2020-06-22/es/test.tsv", sep='\t')
     vocabulario = {}
     #palabra = "encuentra" #1070
     audios = []
@@ -30,12 +30,17 @@ def main():
 
     keys = list(vocabulario)
 
-    for i in range(1, 51):
+    for i in range(1, 101):
         palabra = keys[-i]
         num = vocabulario[palabra]
-        if len(palabra) >= 4:
-            print(f"{palabra}: {num}")
+        if len(palabra) >= 5:
+            pass
+            #print(f"{palabra}: {num}")
 
+    palabras = ["encuentra", "parte", "tiene", "fueron", "entre", "sobre", "ciudad", "durante", "nombre", "embargo", "puede", "primer", "Actualmente", "hasta", "mismo", "Universidad"]
+
+    for p in palabras:
+        print(f"{p}: {vocabulario[p]}")
 
 
 if __name__ == "__main__":
