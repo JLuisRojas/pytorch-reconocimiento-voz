@@ -121,6 +121,7 @@ class CommonVoiceDataset(Dataset):
         self.data_dir = f"{root_dir}cv-corpus-5.1-2020-06-22/{audio_distrib}/"
         #self.data_dir = f"{root_dir}common-voice/{audio_distrib}/"
         self.clips_dir = f"{self.data_dir}clips/"
+        self.distrib = distrib
 
         self.audio_distrib = audio_distrib
         self.distrib = distrib
@@ -139,11 +140,81 @@ class CommonVoiceDataset(Dataset):
             hop_length=int(self.ms*self.sample_rate)
         )
 
+        self._load_normal
+
+
+    def _load_normal(self):
         self.df = pd.read_csv(f"{self.data_dir}{distrib}.tsv", sep='\t')
         if distrib == 'train':
             self.df = self.df.head(30000)
         #else:
         #    self.df = self.df.head(5000)
+
+    def _load_by_frequency(self, canitdad):
+        all_data = pd.read_csv(f"{self.data_dir}{distrib}.tsv", sep='\t')
+
+        vocabulario = {}
+
+        palabras_guardar = [
+            'encuentra'
+        ]
+
+        indices_palabras = { palabra: { } for palabra in palabras_guardar }
+
+        for indice, renglon in all_data.iterrows():
+            cadena = renglon["sentence"]
+            for palabra in cadena.split():
+                if palabra in vocabulario:
+                    vocabulario[palabra] += 1
+                else:
+                    vocabulario[palabra] = 1
+
+                if palabra in palabras_guardar:
+                    indices_palabras[palabra].add(palabra)
+
+        # Ordena los indices de las palabras
+        indices_palabras = {k: v for k,v in sorted(indices_palabras.items(),
+            key=lambda item: item[1], reverse=True)}
+
+        union_indices = { }
+        for palabra in palabras_guardar:
+            union_indices = union_indices.union(indices_palabras[palabra])
+
+        print(f"Cantidad de ejemplos: ")
+        for palabra in palabras_guardar
+            print(f"{palabra}: {indices_palabras[palabra]}")
+        print(f"Interseccion total: {len(union_indices)}")
+
+        indices_ejemplos = []
+        # Separa los datos
+        for i in range(cantidad):
+            keys = list(indices_palabras)
+            if len(keys) > 0:
+                key = keys[0]
+
+                indices_set = indices_palabras[key]
+
+                indice = list(indices_set)[0]
+
+                indices_set.remove(indice)
+
+                indices_ejemplos.append(indice)
+
+                if len(indices_set) == 0:
+                    indices_palabras.pop(key)
+
+        print(len(indices_ejemplos))
+
+        columns = ['path', 'sentence']
+
+        data = []
+
+        for indice in indices_ejemplos:
+            row = all_data.iloc[indice]
+
+            data.append((row['path'], row['sentence']))
+
+        self.df = pd.DataFrame(data, columns=columns)
 
     def __len__(self):
         return len(self.df.index)

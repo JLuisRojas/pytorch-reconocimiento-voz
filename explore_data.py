@@ -22,7 +22,7 @@ def main():
     #if guardar:
     #	audios.append(renglon["path"])
     #	cadenas.append(cadena)
-        
+
 
     vocabulario = {k: v for k,v in sorted(vocabulario.items(), key=lambda item: item[1])}
     print(vocabulario)
