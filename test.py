@@ -114,9 +114,12 @@ class CommonVoiceDataset(Dataset):
                  root_dir="./dataset/",
                  audio_distrib='es',
                  distrib='dev',
+                 frequency=False,
+                 cantidad=1000,
                  ms=0.01,
                  sample_rate=48000,
                  vocab=None):
+        
         self.root_dir = root_dir
         self.data_dir = f"{root_dir}cv-corpus-5.1-2020-06-22/{audio_distrib}/"
         #self.data_dir = f"{root_dir}common-voice/{audio_distrib}/"
@@ -140,26 +143,29 @@ class CommonVoiceDataset(Dataset):
             hop_length=int(self.ms*self.sample_rate)
         )
 
-        self._load_normal
+        if frequency:
+            self._load_by_frequency(cantidad)
+        else:
+            self._load_normal()
 
 
     def _load_normal(self):
-        self.df = pd.read_csv(f"{self.data_dir}{distrib}.tsv", sep='\t')
-        if distrib == 'train':
+        print('Load normal')
+        print(self.distrib)
+        self.df = pd.read_csv(f"{self.data_dir}{self.distrib}.tsv", sep='\t')
+        if self.distrib == 'train':
             self.df = self.df.head(30000)
         #else:
         #    self.df = self.df.head(5000)
 
-    def _load_by_frequency(self, canitdad):
-        all_data = pd.read_csv(f"{self.data_dir}{distrib}.tsv", sep='\t')
+    def _load_by_frequency(self, cantidad):
+        all_data = pd.read_csv(f"{self.data_dir}{self.distrib}.tsv", sep='\t')
 
         vocabulario = {}
 
-        palabras_guardar = [
-            'encuentra'
-        ]
+        palabras_guardar = ["encuentra", "parte", "tiene", "fueron", "entre", "sobre", "ciudad", "durante", "nombre", "embargo", "puede", "primer", "Actualmente", "hasta", "mismo", "Universidad"]
 
-        indices_palabras = { palabra: { } for palabra in palabras_guardar }
+        indices_palabras = { palabra: set() for palabra in palabras_guardar }
 
         for indice, renglon in all_data.iterrows():
             cadena = renglon["sentence"]
@@ -170,19 +176,19 @@ class CommonVoiceDataset(Dataset):
                     vocabulario[palabra] = 1
 
                 if palabra in palabras_guardar:
-                    indices_palabras[palabra].add(palabra)
+                    indices_palabras[palabra].add(indice)
 
         # Ordena los indices de las palabras
         indices_palabras = {k: v for k,v in sorted(indices_palabras.items(),
             key=lambda item: item[1], reverse=True)}
 
-        union_indices = { }
+        union_indices = set()
         for palabra in palabras_guardar:
             union_indices = union_indices.union(indices_palabras[palabra])
 
         print(f"Cantidad de ejemplos: ")
-        for palabra in palabras_guardar
-            print(f"{palabra}: {indices_palabras[palabra]}")
+        for palabra in palabras_guardar:
+            print(f"{palabra}: {len(indices_palabras[palabra])}")
         print(f"Interseccion total: {len(union_indices)}")
 
         indices_ejemplos = []
@@ -215,6 +221,8 @@ class CommonVoiceDataset(Dataset):
             data.append((row['path'], row['sentence']))
 
         self.df = pd.DataFrame(data, columns=columns)
+
+        print(self.df.shape)
 
     def __len__(self):
         return len(self.df.index)
@@ -501,8 +509,15 @@ class CVDataModule(pl.LightningDataModule):
     # TODO: implemetar con las distribuciones correctas
     def setup(self, stage):
         if stage == 'fit':
-            self.cv_train = CommonVoiceDataset(vocab=VocabEsp(), distrib='train')
-            self.cv_val = CommonVoiceDataset(vocab=VocabEsp(), distrib='test')
+            self.cv_train = CommonVoiceDataset(vocab=VocabEsp(), distrib='train',
+                frequency=True,
+                cantidad=1000)
+            self.cv_val1 = CommonVoiceDataset(vocab=VocabEsp(), distrib='test')
+            self.cv_val2 = CommonVoiceDataset(
+                vocab=VocabEsp(), 
+                distrib='test',
+                frequency=True,
+                cantidad=2332)
 
         if stage == 'test':
             self.cv_test = CommonVoiceDataset(vocab=VocabEsp(), distrib='test')
@@ -511,7 +526,10 @@ class CVDataModule(pl.LightningDataModule):
         return DataLoader(self.cv_train, num_workers=12, batch_size=self.batch_size, collate_fn=PadCollate())
 
     def val_dataloader(self):
-        return DataLoader(self.cv_val, num_workers=12, batch_size=self.batch_size, collate_fn=PadCollate())
+        return [
+            DataLoader(self.cv_val1, num_workers=12, batch_size=self.batch_size, collate_fn=PadCollate()),
+            DataLoader(self.cv_val2, num_workers=12, batch_size=self.batch_size, collate_fn=PadCollate())
+        ]
 
     def test_dataloader(self):
         return DataLoader(self.cv_test, num_workers=12, batch_size=self.batch_size, collate_fn=PadCollate())
@@ -603,6 +621,45 @@ class DSModule(pl.LightningModule):
 
         return sum_wer / batch_size
 
+    def _wers(self, sentences, sentence_lenghts, decoded):
+
+        palabras_guardar = ["encuentra", "parte", "tiene", "fueron", "entre", "sobre", "ciudad", "durante", "nombre", "embargo", "puede", "primer", "Actualmente", "hasta", "mismo", "Universidad"]
+        batch_size, _ = sentences.size()
+
+        sentences_true = []
+        sentences_predicted = []
+
+        sum_wers = { p: [] for p in palabras_guardar }
+
+        for batch_idx in range(batch_size):
+            sentence_true = sentences[batch_idx][:sentence_lenghts[batch_idx]]
+
+            sentence_true = self._decode(sentence_true)
+            sentence_predicted = self._decode(decoded[batch_idx])
+
+            size_true_words = len(sentence_true.split())
+
+            for p in palabras_guardar:
+                palabras_true = sentence_true.split()
+                palabras_predicted = sentence_predicted.split()
+
+                if p in palabras_true:
+                    sum_wers[p].append(1 - (palabras_predicted.count(p) / palabras_true.count(p)))
+
+        wers = { }
+
+        for p in sum_wers:
+            wer = sum_wers[p]
+            
+            wer_sum_avg = 0
+
+            if len(wer) > 1:
+                wer_sum_avg = sum(wer) / len(wer)
+            
+            wers[p] = wer_sum_avg
+
+        return wers
+
     def training_step(self, batch, batch_idx):
         features, sentences, fl, sl = batch
         #print(features.shape)
@@ -621,9 +678,12 @@ class DSModule(pl.LightningModule):
 
         wer_metric = self._wer(sentences, sl, decoded)
 
+        wers = self._wers(sentences, sl, decoded)
+
         return {
             'loss': loss,
-            'wer_metric': wer_metric
+            'wer_metric': wer_metric,
+            'wers': wers
         }
 
     
@@ -643,35 +703,80 @@ class DSModule(pl.LightningModule):
             self.current_epoch
         )
 
-    def validation_step(self, batch, batch_idx):
+        self._log_wers(outputs, "Train")
+
+    def validation_step(self, batch, batch_idx, d_idx):
         features, sentences, fl, sl = batch
 
-        _y, fl = self(features, fl)
+        _y_m, fl = self(features, fl)
 
-        _y = self._ctc_reshape(_y)
+        _y = self._ctc_reshape(_y_m)
 
         loss = self.ctc_loss(_y, sentences, fl, sl)
 
+        decoded = self._ctc_decode(_y_m)
+
+        wer_metric = self._wer(sentences, sl, decoded)
+
+        wers = self._wers(sentences, sl, decoded)
+
         return {
-            'loss': loss
+            'loss': loss,
+            'wer_metric': wer_metric,
+            'wers': wers,
+            'idx': d_idx
         }
 
-    def validation_epoch_end(self, outputs):
-        loss = torch.cat([o['loss'] for o in outputs], 0).mean()
+    def _log_wers(self, output_list, distrib):
+        palabras_guardar = ["encuentra", "parte", "tiene", "fueron", "entre", "sobre", "ciudad", "durante", "nombre", "embargo", "puede", "primer", "Actualmente", "hasta", "mismo", "Universidad"]
 
-        self.logger.experiment.add_scalar(
-            'Loss/Val',
-            loss,
-            self.current_epoch
-        )
+        wers = { p: []  for p in palabras_guardar }
+
+        for o in output_list:
+            for p in o['wers']:
+                wers[p].append(o['wers'][p])
+
+        for wer in wers:
+            self.logger.experiment.add_scalar(
+                f"{wer}/WER/{distrib}",
+                sum(wers[wer]) / len(wers[wer]),
+                self.current_epoch
+            )
+
+
+    def validation_epoch_end(self, outputs_datasets):
+        final_loss = 0
+
+        for i in range(len(outputs_datasets)):
+            outputs = outputs_datasets[i]
+            
+            #print(outputs)
+
+            loss = torch.cat([o['loss'] for o in outputs], 0).mean()
+            wer_metric = np.mean([o['wer_metric'] for o in outputs])
+
+            if i == 0:
+                final_loss = loss
+
+            self.logger.experiment.add_scalar(
+                f"Loss/Val{i}",
+                loss,
+                self.current_epoch
+            )
+
+            self.logger.experiment.add_scalar(
+                f"WER/Val{i}",
+                wer_metric,
+                self.current_epoch
+            )
+
+            self._log_wers(outputs, f"Val{i}")
 
         return { 
-            'loss': loss 
+            'loss': final_loss 
         }
 
-print('ADIOS3')
-
-data_module = CVDataModule(batch_size=16)
+data_module = CVDataModule(batch_size=48)
 
 model = DSModule({})
 
